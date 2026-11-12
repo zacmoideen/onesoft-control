@@ -13,12 +13,37 @@
   const APPV = String(window.APP_VERSION || "");
   const osFooter = () => '<div class="os"><b><svg width="16" height="16" viewBox="0 0 88 88" aria-hidden="true"><rect x="6" y="6" width="36" height="36" rx="12" fill="#1f4e9c"/><rect x="46" y="6" width="36" height="36" rx="18" fill="#c9d7f2"/><rect x="6" y="46" width="36" height="36" rx="18" fill="#c9d7f2"/><rect x="46" y="46" width="36" height="36" rx="12" fill="#f28c28"/></svg> OneSoft</b><small>Powered by Zac' + (APPV ? " · v" + esc(APPV) : "") + '</small></div>';
   // Face ID (native plugin @capgo/capacitor-native-biometric); the PIN always works as well
-  const BIO = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.NativeBiometric;
-  async function bioReady() { if (!BIO || ls.get("faceid") === false) return false; try { const r = await BIO.isAvailable(); return !!(r && r.isAvailable); } catch (e) { return false; } }
-  async function bioUnlock() {
-    try { await BIO.verifyIdentity({ reason: "Unlock Licence Control", title: "Licence Control" }); ls.set("pinTries", 0); LOCKED = false; listScreen(); return true; }
-    catch (e) { return false; }
+  // Face ID: native plugin in the iPhone app; in the web app a passkey on this device (Safari asks for Face ID / Touch ID)
+  const NBIO = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.NativeBiometric;
+  const WBIO = !NBIO && window.PublicKeyCredential && navigator.credentials && window.isSecureContext;
+  const BIO = NBIO || WBIO;
+  const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf))), unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+  const rnd = n => crypto.getRandomValues(new Uint8Array(n));
+  async function bioReady() {
+    if (ls.get("faceid") === false) return false;
+    if (NBIO) { try { const r = await NBIO.isAvailable(); return !!(r && r.isAvailable); } catch (e) { return false; } }
+    if (WBIO) { try { return !!ls.get("webauthn") && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable(); } catch (e) { return false; } }
+    return false;
   }
+  async function webBioSetup() {   // makes a passkey for this device only to unlock the app (the PIN still works)
+    const c = await navigator.credentials.create({ publicKey: { challenge: rnd(32), rp: { name: "OneSoft Licence Control", id: location.hostname },
+      user: { id: rnd(16), name: "onesoft-licence-unlock", displayName: "Licence Control unlock" },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required", residentKey: "preferred" }, timeout: 60000 } });
+    ls.set("webauthn", b64(c.rawId)); ls.set("faceid", true);
+  }
+  async function bioUnlock() {
+    try {
+      if (NBIO) await NBIO.verifyIdentity({ reason: "Unlock Licence Control", title: "Licence Control" });
+      else {
+        const a = await navigator.credentials.get({ publicKey: { challenge: rnd(32), rpId: location.hostname, userVerification: "required", timeout: 60000,
+          allowCredentials: [{ type: "public-key", id: unb64(ls.get("webauthn")), transports: ["internal", "hybrid"] }] } });
+        if (!a || !a.response || !(new Uint8Array(a.response.authenticatorData)[32] & 4)) throw new Error("not verified");   // UV flag
+      }
+      ls.set("pinTries", 0); LOCKED = false; listScreen(); return true;
+    } catch (e) { return false; }
+  }
+
 
   function toast(t, ms) { const d = document.createElement("div"); d.className = "toast"; d.textContent = t; document.body.appendChild(d); setTimeout(() => d.remove(), ms || 2500); }
   function head(title, sub, btn) { $("#ttl").innerHTML = esc(title) + "<small>" + esc(sub || "") + "</small>"; $("#hbtn").innerHTML = btn || ""; }
@@ -68,8 +93,8 @@
     let v = "";
     $("#main").innerHTML = '<div class="pin" id="dots">' + "<i></i>".repeat(6) + '</div><div class="err center" id="p_err"></div><div class="pad">' +
       [1, 2, 3, 4, 5, 6, 7, 8, 9, "", 0, "⌫"].map(k => k === "" ? "<span></span>" : '<button data-k="' + k + '">' + k + "</button>").join("") + "</div>" +
-      (mode === "unlock" ? '<p class="center"><button class="link" id="p_bio" hidden>Use Face ID</button></p><p class="center"><button class="link" id="p_out">Forgot PIN – sign in again</button></p>' : "") + osFooter();
-    if (mode === "unlock") bioReady().then(ok => { if (!ok || !$("#p_bio")) return; $("#p_bio").hidden = false; $("#p_bio").onclick = bioUnlock; if (!document.hidden) bioUnlock(); });
+      (mode === "unlock" ? '<p class="center"><button class="p" id="p_bio" hidden style="width:100%">Unlock with Face ID</button></p><p class="center"><button class="link" id="p_out">Forgot PIN – sign in again</button></p>' : "") + osFooter();
+    if (mode === "unlock") bioReady().then(ok => { if (!ok || !$("#p_bio")) return; $("#p_bio").hidden = false; $("#p_bio").onclick = bioUnlock; if (NBIO && !document.hidden) bioUnlock(); });
     const dots = () => $("#dots").querySelectorAll("i").forEach((d, i) => d.className = i < v.length ? "f" : "");
     $("#main").querySelectorAll(".pad button").forEach(b => b.onclick = async () => {
       const k = b.dataset.k; if (k === "⌫") v = v.slice(0, -1); else if (v.length < 6) v += k; dots();
@@ -102,13 +127,18 @@
       $("#rows").querySelectorAll(".cust").forEach(d => d.onclick = () => detailScreen(d.dataset.id));
     };
     $("#main").innerHTML = '<input id="q" placeholder="Search customers" value="' + esc(q || "") + '" style="margin-bottom:12px"><div id="rows"></div>' +
-      '<p class="center"><button class="link" id="apps">⬆ App updates</button>' + (BIO ? ' · <button class="link" id="fid">Face ID: ' + (ls.get("faceid") === false ? "off" : "on") + '</button>' : "") + '</p>' +
+      '<p class="center"><button class="link" id="apps">⬆ App updates</button>' + (BIO ? ' · <button class="link" id="fid">Face ID: ' + ((NBIO ? ls.get("faceid") !== false : ls.get("faceid") === true && !!ls.get("webauthn")) ? "on" : "off") + '</button>' : "") + '</p>' +
       '<p class="center"><button class="link" id="refresh">Refresh</button> · <button class="link" id="lock">Lock</button> · <button class="link" id="logout">Sign out</button></p>' + osFooter();
     $("#q").oninput = draw; draw();
     $("#refresh").onclick = async () => { try { await load(); draw(); toast("Updated"); } catch (e) { toast(e.message, 4000); } };
     $("#lock").onclick = () => { LOCKED = true; pinScreen("unlock"); };
     $("#apps").onclick = () => appsScreen();
-    if ($("#fid")) $("#fid").onclick = () => { ls.set("faceid", ls.get("faceid") === false); listScreen(); toast("Face ID " + (ls.get("faceid") === false ? "off" : "on")); };
+    if ($("#fid")) $("#fid").onclick = async () => {
+      const on = NBIO ? ls.get("faceid") !== false : ls.get("faceid") === true && !!ls.get("webauthn");
+      if (on) { ls.set("faceid", false); listScreen(); return toast("Face ID off"); }
+      if (WBIO) { try { await webBioSetup(); } catch (e) { return toast("Face ID was not set up: " + (e.message || e.name), 4000); } }
+      ls.set("faceid", true); listScreen(); toast("Face ID on – use it next time you unlock");
+    };
     $("#logout").onclick = async () => { ls.set("pin", null); ls.set("cache", null); LIST = []; await C.signOut(); loginScreen(); };
     try { await load(); draw(); } catch (e) { toast(e.message, 4000); }
   }
